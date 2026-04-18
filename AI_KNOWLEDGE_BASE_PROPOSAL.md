@@ -20,6 +20,7 @@
 10. [總預算估算](#10-總預算估算)
 11. [風險與注意事項](#11-風險與注意事項)
 12. [最終建議](#12-最終建議)
+13. [實作細節補充（2026年4月）](#13-實作細節補充2026年4月)
 
 ---
 
@@ -711,3 +712,260 @@ LLM Wiki 整理好的資料
 ---
 
 *本方案書由 GitHub Copilot 協助整理，最終決策請結合公司實際情況評估。*
+
+---
+
+## 13. 實作細節補充（2026年4月）
+
+> 本節記錄 2026 年 4 月深入討論後的架構確認與實作細節。
+
+### 13.1 正式系統架構（已確認）
+
+```
+員工
+  ↓
+JCK Web System（前台，架設中）
+  ↓  對話框呼叫 Dify API
+Dify（AI 後台）
+  ↙                ↘
+知識庫（RAG）      Agent 工具
+  ↑
+LLM Wiki（Markdown 條目，pgvector 向量化）
+  ↑
+Email 清洗管道（後台，n8n 排程觸發）
+```
+
+**關鍵架構決定：**
+- **JCK Web System 是唯一前台**，員工不直接接觸 Dify 介面
+- **Dify 在後台**，員工只見到 JCK Web System 裡的對話框
+- **n8n 不在對話流程中**，只作後台排程/餵料工具
+
+---
+
+### 13.2 n8n 的正確角色
+
+n8n 不是對話中間層，是**後台資料管道**：
+
+| n8n 的用途 | 說明 |
+|-----------|------|
+| IMAP 輪詢 / Webhook | 監測新 Email 進來 |
+| 觸發清洗流程 | 呼叫 Python 清洗腳本 |
+| 呼叫 LLM 提取 | 把清洗後的文字送 Ollama/GPT |
+| 上傳 Dify 知識庫 | 呼叫 Dify Knowledge API |
+| 排程同步 | 每晚定時更新整個知識庫 |
+
+```
+新 Email 進來
+  → n8n 觸發
+  → Python 清洗
+  → LLM 提取成 Wiki 條目
+  → 上傳 Dify Knowledge Base
+  （員工對話時已有最新知識）
+```
+
+---
+
+### 13.3 Email 去雜訊：三個開源 Python 套件
+
+**直接 pip install，無需商業服務，資料不離開公司：**
+
+```bash
+pip install mail-parser
+pip install email_reply_parser
+pip install talon
+```
+
+| 套件 | 功能 | 需要 LLM？ |
+|------|------|:---:|
+| `mail-parser` | 解析 .eml，HTML 轉純文字，提取寄件人/主旨 | 否 |
+| `email_reply_parser` | 切走引用回覆鏈（`> 原文...`），只留最新段落 | 否 |
+| `talon` | 切走簽名塊（姓名/職銜/電話），ML 內建模型 | 否（內建ML） |
+
+**注意：** `talon` 依賴 numpy/scikit-learn，如環境有限制可只用 `email_reply_parser`（純規則，已解決 80% 雜訊）。
+
+**完整清洗流程：**
+
+```python
+import mailparser
+from email_reply_parser import EmailReplyParser
+import talon
+talon.init()
+from talon import signature
+
+# 1. 解析原始 .eml
+mail = mailparser.parse_from_file("incoming.eml")
+raw_body = mail.body  # HTML 自動轉純文字
+
+# 2. 切走引用鏈，只留最新回覆
+latest_reply = EmailReplyParser.parse_reply(raw_body)
+
+# 3. 切走簽名塊
+clean_text, sig = signature.extract(latest_reply, sender=mail.from_[0][1])
+
+# clean_text 已去除：HTML標籤、引用舊郵件、簽名塊、免責聲明
+```
+
+---
+
+### 13.4 Email → LLM Wiki 完整流程
+
+**兩步走：去雜訊 → LLM 提取成 Wiki 條目**
+
+```
+原始 Email
+  ↓
+[第一層：三個套件去雜訊]  ← 不需要 LLM，快速便宜
+  ↓
+[第二層：LLM 提取結構化知識]  ← 需要 LLM，把清洗後文字變 Wiki 條目
+  ↓
+Markdown Wiki 條目（這才是知識庫的內容）
+  ↓
+上傳 Dify Knowledge Base
+```
+
+**LLM 提取的 System Prompt：**
+
+```
+你是知識提取助手。從以下 Email 中提取：
+1. 關鍵決定/結論
+2. 涉及的公司/客戶名稱
+3. 涉及的日期/截止日
+4. 行動項目（誰要做什麼）
+5. 費用/金額（如有）
+
+忽略問候語、簽名、免責聲明、引用的舊郵件。
+輸出格式：Markdown，含 YAML Front Matter。
+```
+
+**輸出的 Wiki 條目範例：**
+
+```markdown
+---
+title: 陳大文有限公司 - 周年申報日期更改
+category: clients
+client: 陳大文有限公司
+date: 2026-04-10
+source: email
+tags: [周年申報, 日期更改]
+---
+
+## 事件摘要
+客戶申請將周年申報日期由 6 月改為 9 月。
+
+## 關鍵細節
+- 申請日期：2026-04-10
+- 負責員工：Mary
+- 狀態：待處理
+
+## 行動項目
+- [ ] 提交 NAR1 表格至公司註冊處
+```
+
+**核心原則：不存原始 Email，只存提取後的知識條目。**
+原始 Email 的雜訊會稀釋向量相似度，導致 RAG 找錯文件。
+
+---
+
+### 13.5 LLM Wiki 資料夾結構（標準設計）
+
+```
+jck-llm-wiki/
+├── clients/                    ← 客戶相關
+│   ├── 陳大文有限公司.md        ← 一個客戶一個檔案（累積更新）
+│   ├── 永興貿易.md
+│   └── _index.md              ← 這個分類的目錄
+│
+├── procedures/                 ← 作業程序
+│   ├── 周年申報流程.md
+│   ├── 更改董事程序.md
+│   └── 轉讓股份流程.md
+│
+├── fees/                       ← 費用資料
+│   ├── 政府費用一覽.md
+│   └── JCK收費標準.md
+│
+├── emails/                     ← Email 提取的知識條目（按月份）
+│   ├── 2026-04/
+│   │   ├── 陳大文_周年申報_20260410.md
+│   │   └── 永興貿易_更改董事_20260415.md
+│   └── 2026-03/
+│
+├── regulations/                ← 法規知識
+│   └── 公司條例重點.md
+│
+└── README.md                   ← Wiki 總目錄
+```
+
+**YAML Front Matter 的作用：** Dify 上傳時可設定 Metadata Filter，按 `client` 或 `tags` 過濾，大幅提升搜尋準確度：
+
+```
+員工問：「陳大文公司有什麼待辦？」
+→ Dify 先過濾 client = 陳大文有限公司 的條目
+→ 再語義搜尋
+→ 準確度大幅提升，不會找到其他客戶的資料
+```
+
+---
+
+### 13.6 PostgreSQL 在整個系統的角色
+
+整個系統只需**一個 PG 伺服器**，加裝 `pgvector` extension：
+
+```
+同一個 PostgreSQL 伺服器（192.168.111.10）
+├── jck_db          ← 現有 JCK Web System（客戶/帳單/公司秘書）
+├── dify_db         ← Dify 後台（對話記錄/用戶/知識庫 metadata）
+└── wiki_vectors    ← LLM Wiki 的 embedding（pgvector）
+```
+
+**pgvector 安裝與用法：**
+
+```sql
+-- 一次性安裝
+CREATE EXTENSION vector;
+
+-- Wiki 條目的向量表
+CREATE TABLE wiki_chunks (
+    id          SERIAL PRIMARY KEY,
+    title       TEXT,
+    content     TEXT,
+    embedding   vector(1536),   -- Ollama/OpenAI 輸出的向量
+    client      TEXT,           -- 用作 Metadata Filter
+    category    TEXT,
+    source      TEXT,           -- email / manual / procedure
+    created_at  TIMESTAMP DEFAULT NOW()
+);
+
+-- 語義搜尋：找最相似的 5 條
+SELECT title, content
+FROM wiki_chunks
+WHERE client = '陳大文有限公司'   -- Metadata Filter
+ORDER BY embedding <=> $1::vector  -- 向量相似度排序
+LIMIT 5;
+```
+
+**Dify 已原生支援 pgvector**，在 Dify 設定頁面選擇 pgvector 作向量資料庫即可，不需要另裝 Weaviate/Qdrant。
+
+---
+
+### 13.7 推薦的開源工具組合（配合 Dify）
+
+| 類別 | 工具 | GitHub | 用途 |
+|------|------|--------|------|
+| **PDF 解析** | MinerU | `opendatalab/MinerU` | 中文 PDF/掃描件解析，支援 OCR + 版面分析 |
+| **本地 LLM** | Ollama | `ollama/ollama` | 本地跑模型，Dify 直接支援，零 API 費用 |
+| **後台管道** | n8n | `n8n-io/n8n` | Email 監測、排程同步、呼叫 Dify API |
+| **監控** | LangFuse | `langfuse/langfuse` | 追蹤每次問答品質、Token 用量（Dify 直接整合） |
+| **Email 清洗** | email_reply_parser | `jwass/email_reply_parser` | 切走引用回覆鏈 |
+| **簽名識別** | talon | `mailgun/talon` | 切走簽名塊（Mailgun 出品） |
+
+**優先安裝順序：**
+1. Dify + Ollama（本地模型，零成本試用）
+2. LangFuse（監控回答品質，Dify 5 分鐘整合）
+3. n8n + email_reply_parser（Email 自動清洗入庫）
+4. MinerU（如需處理 PDF 文件）
+
+---
+
+*本方案書由 GitHub Copilot 協助整理，最終決策請結合公司實際情況評估。*
+*第 13 節於 2026 年 4 月 18 日更新。*
