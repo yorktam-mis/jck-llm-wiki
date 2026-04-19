@@ -1416,7 +1416,141 @@ llama-server.exe -hf bartowski/Qwen2.5-72B-Instruct-GGUF:Q8_0 -ngl 99 --parallel
 
 ---
 
+---
+
+### 13.13 路徑 B 上傳後：確保 Dify LLM 讀懂 Wiki 頁面的三個配置
+
+> 路徑 B 的 `.md` 不是原生 Dify Workflow 產生的，但 **Dify 的 RAG 不在乎文件怎麼來**。它只在乎兩件事：chunk 夠不夠清晰、LLM 有沒有被告知「你在讀什麼」。以下是組裝時必須配置的三個地方。
+
+---
+
+#### 配置 1：上傳時的 Chunking 策略（Custom Separator）
+
+Dify 預設按固定字數切塊。Wiki 頁面的 `## 事件摘要` 和 `## 行動項目` 會被切斷在不同 chunk，LLM 拿到的是殘缺段落。
+
+**解法：** 上傳 Wiki 頁面時，在 Dify Knowledge 設定選 **Custom Separator**，填入 `\n## `，讓每個二級標題各自成一個完整 chunk：
+
+```
+原始 wiki 頁面：
+  ---
+  title: 陳大文有限公司 - 周年申報日期更改
+  client: 陳大文有限公司
+  ---
+  ## 事件摘要
+  客戶申請將周年申報日期由 6 月改為 9 月。
+  ## 行動項目
+  - [ ] 提交 NAR1 表格至公司註冊處
+
+切出來的 chunks（正確）：
+  Chunk 1：「陳大文有限公司 - 周年申報 ／ 事件摘要 ／ 客戶申請...」
+  Chunk 2：「陳大文有限公司 - 周年申報 ／ 行動項目 ／ 提交 NAR1」
+
+若用預設字數切塊（錯誤）：
+  Chunk X：「...申請將周年申報日期由 6 月改...」← 無頭無尾，語義殘缺
+```
+
+---
+
+#### 配置 2：上傳 API 呼叫時，Frontmatter 分離為 Metadata
+
+YAML frontmatter 不是正文內容，不應進入向量搜尋。把它分離出來作為 Dify 的文件 Metadata，才能做 **Metadata Filter**（先按客戶名縮小範圍，再語義搜尋）。
+
+```python
+import yaml, re
+
+def split_frontmatter(md_text):
+    """把 YAML frontmatter 和正文分開"""
+    match = re.match(r'^---\n(.*?)\n---\n(.*)', md_text, re.DOTALL)
+    if match:
+        meta = yaml.safe_load(match.group(1))
+        body = match.group(2)
+    else:
+        meta, body = {}, md_text
+    return meta, body
+
+meta, body = split_frontmatter(wiki_page_content)
+
+# 上傳到 Dify Knowledge API
+dify_api.upload_document(
+    dataset_id=DATASET_ID,
+    content=body,                         # 只傳正文，不含 frontmatter
+    metadata={
+        "client":   meta.get("client"),   # 啟用 Metadata Filter
+        "category": meta.get("type"),     # entity / concept / source
+        "tags":     meta.get("tags"),
+    },
+    indexing_technique="high_quality",
+    process_rule={
+        "mode": "custom",
+        "rules": {
+            "segmentation": {
+                "separator": "\n## ",     # 對應配置 1
+                "max_tokens": 800
+            },
+            "pre_processing_rules": [
+                {"id": "remove_extra_spaces", "enabled": True},
+                {"id": "remove_urls_emails",  "enabled": False}
+            ]
+        }
+    }
+)
+```
+
+**效果：** 員工問「陳大文公司的事」，Dify 先按 `client = 陳大文有限公司` 過濾，語義搜尋範圍從全庫縮小至單一客戶的 chunks，準確度大幅提升。
+
+---
+
+#### 配置 3：Dify Workflow 的 LLM Node System Prompt
+
+這是最關鍵的一步。System Prompt 告訴 LLM「你拿到的 context 是結構化筆記，不是隨機文章」，LLM 才知道如何解讀各個欄位。
+
+```
+你是 JCK 公司秘書服務的 AI 助手。
+
+你會收到從知識庫中找到的相關段落（以 <context> 標注）。
+這些段落來自兩種來源：
+1. 客戶往來摘要（已整理的結構化筆記，包含「事件摘要」、「行動項目」等欄位）
+2. 靜態參考文件（法規、費用表、作業程序）
+
+讀取 <context> 時的規則：
+- 「行動項目」欄位（含 [ ] 符號）代表尚未完成的待辦事項
+- 「事件摘要」欄位是已確認的事實
+- 「知識衝突」欄位代表資料有矛盾，需明確告知員工
+- 日期格式為 YYYY-MM-DD
+- 如果 context 中沒有相關資料，直接說「知識庫中未找到相關記錄」，不要猜測或編造
+
+回答語言：繁體中文。
+引用來源時，標注文件標題，例如「根據《陳大文有限公司》客戶檔案...」。
+```
+
+---
+
+#### 三個配置的關係
+
+```
+上傳時（一次性設定）：
+  Frontmatter → Dify Metadata（供 Metadata Filter 用）
+  正文 → 按 "\n## " 切 chunk → 向量化 → pgvector
+
+查詢時（每次觸發）：
+  員工問題
+    → Dify 先做 Metadata Filter（縮小範圍）
+    → 再語義搜尋（找最相關 chunks）
+    → chunks 注入 System Prompt 的 <context>
+    → LLM 按 System Prompt 規則解讀結構化筆記
+    → 組合答案回傳
+
+LLM 讀不讀懂路徑 B 的 Wiki 頁面？
+  ✅ 讀得懂——因為：
+     1. Chunk 是按 ## 完整切出的有意義段落
+     2. System Prompt 解釋了「行動項目」「事件摘要」等欄位的含義
+     3. 對 LLM 而言，Wiki Markdown 和原生 Dify Workflow 輸出的文字完全一樣
+```
+
+---
+
 *本方案書由 GitHub Copilot 協助整理，最終決策請結合公司實際情況評估。*
 *第 13 節於 2026 年 4 月 18 日更新；第 13.8 節於 2026 年 4 月 19 日新增（參考 jason-effi-lab/karpathy-llm-wiki-vault）。*
 *第 13.9–13.11 節於 2026 年 4 月 19 日新增（硬件模型選型、Tool Use、llama-server Windows 並發）。*
 *第 13.12 節於 2026 年 4 月 19 日新增（兩條 Ingest 路徑串聯 Dify RAG 全局架構圖）。*
+*第 13.13 節於 2026 年 4 月 19 日新增（路徑 B 上傳後確保 LLM 讀懂的三個配置：Chunking / Metadata / System Prompt）。*
