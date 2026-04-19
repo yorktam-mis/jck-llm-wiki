@@ -1129,5 +1129,196 @@ last_updated: YYYY-MM-DD
 
 ---
 
+---
+
+### 13.9 硬件選型補充：大模型還是小模型？
+
+> **結論先說：有好硬件就直接跑大模型，沒有理由刻意降級。**
+
+#### 為什麼之前說「小模型做 Ingest」？
+
+之前建議「14B 做 Ingest、32B 做 Query」的前提是：假設 GPU 只有 **24GB VRAM**（如 RTX 4090），只能跑 14B，沒得選。那個建議是資源分配的妥協，不是能力上的判斷。
+
+#### 如果你買了 RTX Pro 6000 Blackwell（96GB VRAM）
+
+```
+直接跑 qwen2.5:72b Q4（佔 ~40GB VRAM）
+還剩 56GB 空間
+
+→ 一個模型，Ingest + Query + Lint 全包
+→ 不用管「哪個任務用哪個模型」
+→ 品質最好，架構最簡單
+```
+
+#### 96GB VRAM 下的量化選擇
+
+| 量化 | 72B 佔用 | 品質 | 建議 |
+|------|---------|------|------|
+| Q8_0 | ~77GB | 幾乎無損 | ✅ **首選，完整放入** |
+| Q4_K_M | ~43GB | 品質/大小平衡 | 備選 |
+| Q3_K_M | ~33GB | 可接受 | 不必要 |
+
+**96GB → 選 Q8_0，一次到位。**
+
+#### 並發壓力時的升級路徑
+
+50 人輪流查詢，Ollama（排隊）可能讓第 5 個人等待。解法：
+
+```
+初期（測試/少量使用）  → Ollama + 72B Q8_0
+正式上線（50人並發）  → 換 llama-server（見 13.11 節）
+極高並發（100人+）   → 考慮第二張卡（192GB NVLink）
+```
+
+模型不需要換，只是換部署方式。
+
+---
+
+### 13.10 Tool Use：本地模型接外部 API 查詢
+
+> 本地模型沒有的知識，可以即時查詢外部來源，再整合成答案。這個模式叫做 **Tool Use（工具呼叫）**。
+
+#### 運作流程
+
+```
+員工問：「ABC Ltd 今年的法定申報期限是什麼？」
+
+本地 72B 模型判斷：
+  → 知識庫中無此資料，需要即時查詢
+  → 呼叫工具：查詢 CR API（companies.gov.hk）
+
+外部 API 回傳結果
+  → 本地模型整合，用自然語言組合成答案
+```
+
+#### JCK 可接入的外部來源
+
+| 來源 | 用途 |
+|------|------|
+| 公司查冊 (CR) API | 公司狀態、董事、申報紀錄 |
+| 香港法例 (legislation.gov.hk) | 法規原文查詢 |
+| 內部 PostgreSQL | 客戶資料、歷史紀錄 |
+| JCK Web System REST API | 現有系統雙向呼叫 |
+| 外部模型 API（OpenAI / Claude） | 本地模型信心不足時備援 |
+
+#### 實作方式（Python 中介層）
+
+```python
+# 模型輸出 JSON 工具呼叫指令
+# {"tool": "cr_search", "company_no": "12345678"}
+
+# Python 攔截 → 呼叫對應 API → 把結果回注 messages
+messages.append({"role": "tool", "content": cr_api_result})
+
+# 模型再用這個結果生成最終答案
+```
+
+**安全邊界：** 模型不能直接上網，只能呼叫你授權的工具清單。所有外部呼叫經過 Python 中介層，敏感欄位（客戶名稱等）送出前先遮蔽。
+
+#### 接外部大模型（Model Cascade）
+
+本地模型信心不足時，可自動升級至外部 API：
+
+```
+本地 72B 嘗試回答
+  → 判斷為超出範圍或信心不足
+  → 遮蔽敏感欄位
+  → 呼叫 OpenAI / Claude API
+  → 外部模型回答
+  → 本地模型整合 + 過濾後輸出給員工
+```
+
+**前提：** Qwen2.5 72B 支援 Function Calling，需以支援格式呼叫 llama-server（`--jinja` 參數）。
+
+---
+
+### 13.11 Windows 並發部署：llama-server
+
+> **Windows 不支援 vLLM，但 `llama-server`（llama.cpp 內建）是完整替代方案。**
+
+#### 為什麼不用 Ollama 做並發
+
+Ollama 在 Windows 上只能排隊處理：50 個人同時問，第 50 個人要等前 49 個完成。`llama-server` 支援真正並發，效能接近 Linux vLLM。
+
+#### 安裝方式
+
+從 [llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases) 下載預編譯 Windows 執行檔（無需 Python 環境）：
+
+```
+llama-b????-bin-win-cuda-cu12.x.x-x64.zip  ← NVIDIA GPU 版本
+```
+
+解壓後直接執行 `llama-server.exe`。
+
+#### 啟動指令（96GB VRAM，72B Q8_0）
+
+```bat
+llama-server.exe ^
+  -m qwen2.5-72b-instruct-Q8_0.gguf ^
+  -ngl 99 ^
+  --parallel 8 ^
+  --cont-batching ^
+  --jinja ^
+  --port 8080
+```
+
+| 參數 | 說明 |
+|------|------|
+| `-ngl 99` | 所有層放 VRAM（GPU 全速） |
+| `--parallel 8` | 同時處理 8 個請求 |
+| `--cont-batching` | Continuous batching，預設開啟 |
+| `--jinja` | 啟用 Function Calling / Tool Use |
+
+#### 與其他方案對比
+
+| | Ollama | llama-server | vLLM |
+|--|:--:|:--:|:--:|
+| Windows 原生 | ✅ | ✅ | ❌ |
+| 真正並發 | ❌ 排隊 | ✅ | ✅ |
+| Continuous batching | ❌ | ✅ | ✅ |
+| OpenAI 兼容 API | ✅ | ✅ | ✅ |
+| Function Calling | ✅ | ✅ `--jinja` | ✅ |
+| 效能 vs vLLM | — | ~80-90% | 100% |
+| 設定複雜度 | 極簡 | 簡單 | 需要 Linux |
+
+#### Python 呼叫方式（完全不變）
+
+```python
+import openai
+
+client = openai.OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="none"
+)
+
+response = client.chat.completions.create(
+    model="qwen2.5-72b",
+    messages=[{"role": "user", "content": "你好"}]
+)
+```
+
+llama-server 完全兼容 OpenAI API 格式，現有代碼無需修改。
+
+#### 支援的模型格式
+
+**凡是 GGUF 格式的模型都可以跑。** 主要支援：
+
+| 系列 | 代表模型 |
+|------|---------|
+| **Qwen** | Qwen2.5 7B / 14B / 32B / 72B ← JCK 首選 |
+| **Llama** | Llama 3.1 / 3.2 / 3.3（Meta） |
+| **DeepSeek** | DeepSeek-R1（含思維鏈） |
+| **Gemma** | Google Gemma 3 |
+| **Phi** | Microsoft Phi-4 |
+
+模型可從 Hugging Face 下載，或直接用 `-hf` 參數讓 llama-server 自動下載：
+
+```bat
+llama-server.exe -hf bartowski/Qwen2.5-72B-Instruct-GGUF:Q8_0 -ngl 99 --parallel 8
+```
+
+---
+
 *本方案書由 GitHub Copilot 協助整理，最終決策請結合公司實際情況評估。*
 *第 13 節於 2026 年 4 月 18 日更新；第 13.8 節於 2026 年 4 月 19 日新增（參考 jason-effi-lab/karpathy-llm-wiki-vault）。*
+*第 13.9–13.11 節於 2026 年 4 月 19 日新增（硬件模型選型、Tool Use、llama-server Windows 並發）。*
