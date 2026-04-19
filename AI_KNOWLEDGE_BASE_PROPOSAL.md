@@ -328,7 +328,7 @@ JCK Web System  ←──→  Dify AI 知識庫
 
 ### 6.1 Dify 介面可以改到什麼程度？
 
-**Dify 是開源的（Apache 2.0），前端是 Next.js，理論上可以改任何東西。**
+**Dify 是開源的（修改版 Apache 2.0，附加多租戶 SaaS 及 Logo 限制），前端是 Next.js，理論上可以改任何東西。**
 
 | 改動類型 | 難度 | 說明 |
 |---------|:----:|------|
@@ -410,7 +410,8 @@ LLM Wiki 整理好的資料
 | UPS 不斷電 | 2000VA | ~$3,000 |
 | **合計** | | **~$43,000** |
 
-**能跑的 AI 模型：** Llama3 70B（量化版）、Qwen2.5 72B  
+**能跑的 AI 模型：** Qwen2.5 32B（Q8 量化）、Llama3 8B / 14B  
+**限制：** 24GB VRAM 無法跑 70B 級模型，最大約 32B-34B  
 **支援人數：** 30-40 人同時使用
 
 ---
@@ -441,7 +442,8 @@ LLM Wiki 整理好的資料
 
 **選項 3 硬件總計：~$147,300**
 
-**能跑的 AI 模型：** Llama3 405B（最強開源模型）  
+**能跑的 AI 模型：** Qwen2.5 72B Q4（~43GB，可放入 A6000 48GB 單卡）、Llama3 70B Q4  
+**注意：** 405B 級模型需 200GB+ VRAM，此配置無法運行  
 **支援人數：** 50 人完全無壓力，VIP 客戶資料完全實體隔離
 
 ---
@@ -606,7 +608,7 @@ LLM Wiki 整理好的資料
 
 ## 11. 風險與注意事項
 
-### 8.1 技術風險
+### 11.1 技術風險
 
 | 風險 | 可能性 | 解決方法 |
 |------|:------:|---------|
@@ -615,7 +617,7 @@ LLM Wiki 整理好的資料
 | 資料外洩 | 低 | 本地部署，不連外網，加防火牆 |
 | 員工不願意用 | 中 | 從最常用的查詢場景入手，讓員工看到效益 |
 
-### 8.2 重要決策點
+### 11.2 重要決策點
 
 **Q：應該用雲端 AI 還是本地 AI？**
 
@@ -646,7 +648,7 @@ LLM Wiki 整理好的資料
   - 你已有 Python 能力，LLM Wiki 腳本可以自行維護
 ```
 
-### 8.3 不應做的事
+### 11.3 不應做的事
 
 - ❌ 不要一開始就把所有文件全部導入（先測試，確認效果好再增加）
 - ❌ 不要跳過驗證期直接買最貴的硬件
@@ -929,7 +931,7 @@ CREATE TABLE wiki_chunks (
     id          SERIAL PRIMARY KEY,
     title       TEXT,
     content     TEXT,
-    embedding   vector(1536),   -- Ollama/OpenAI 輸出的向量
+    embedding   vector(1536),   -- 維度取決於 embedding 模型（OpenAI ada-002=1536, nomic-embed-text=768, bge-m3=1024）
     client      TEXT,           -- 用作 Metadata Filter
     category    TEXT,
     source      TEXT,           -- email / manual / procedure
@@ -956,7 +958,7 @@ LIMIT 5;
 | **本地 LLM** | Ollama | `ollama/ollama` | 本地跑模型，Dify 直接支援，零 API 費用 |
 | **後台管道** | n8n | `n8n-io/n8n` | Email 監測、排程同步、呼叫 Dify API |
 | **監控** | LangFuse | `langfuse/langfuse` | 追蹤每次問答品質、Token 用量（Dify 直接整合） |
-| **Email 清洗** | email_reply_parser | `jwass/email_reply_parser` | 切走引用回覆鏈 |
+| **Email 清洗** | email_reply_parser | `zapier/email-reply-parser` | 切走引用回覆鏈 |
 | **簽名識別** | talon | `mailgun/talon` | 切走簽名塊（Mailgun 出品） |
 
 **優先安裝順序：**
@@ -1162,11 +1164,11 @@ last_updated: YYYY-MM-DD
 
 #### 並發壓力時的升級路徑
 
-50 人輪流查詢，Ollama（排隊）可能讓第 5 個人等待。解法：
+50 人輪流查詢，Ollama 預設逐一處理（`OLLAMA_NUM_PARALLEL=1`），可能讓第 5 個人等待。雖可調高 `OLLAMA_NUM_PARALLEL`，但其並發機制是複製 context（記憶體倍增），高負載下效率不如 llama-server 的 continuous batching。解法：
 
 ```
-初期（測試/少量使用）  → Ollama + 72B Q8_0
-正式上線（50人並發）  → 換 llama-server（見 13.11 節）
+初期（測試/少量使用）  → Ollama + 72B Q8_0（足夠）
+正式上線（50人並發）  → 換 llama-server（見 13.11 節，效率更高）
 極高並發（100人+）   → 考慮第二張卡（192GB NVLink）
 ```
 
@@ -1238,7 +1240,7 @@ messages.append({"role": "tool", "content": cr_api_result})
 
 #### 為什麼不用 Ollama 做並發
 
-Ollama 在 Windows 上只能排隊處理：50 個人同時問，第 50 個人要等前 49 個完成。`llama-server` 支援真正並發，效能接近 Linux vLLM。
+Ollama 預設 `OLLAMA_NUM_PARALLEL=1`（逐一處理）。雖可設定大於 1 來啟用並發，但其實作方式是複製 context（例如 4 並發 = 4 倍記憶體），且無 continuous batching，高並發下效率不如 `llama-server`。
 
 #### 安裝方式
 
@@ -1274,7 +1276,7 @@ llama-server.exe ^
 | | Ollama | llama-server | vLLM |
 |--|:--:|:--:|:--:|
 | Windows 原生 | ✅ | ✅ | ❌ |
-| 真正並發 | ❌ 排隊 | ✅ | ✅ |
+| 真正並發 | ⚠️ 可設定但效率較低 | ✅ | ✅ |
 | Continuous batching | ❌ | ✅ | ✅ |
 | OpenAI 兼容 API | ✅ | ✅ | ✅ |
 | Function Calling | ✅ | ✅ `--jinja` | ✅ |
