@@ -1729,9 +1729,336 @@ Docker 出問題時：
 
 ---
 
+---
+
+## 13.15 CSA 資料庫 Text-to-SQL：讓 LLM 即時查詢公司秘書資料
+
+### 核心問題：CSA 結構化資料不應該放進 Knowledge Base
+
+CSA 資料庫有 5,666 間公司、14,004 個人物、40,910 條持股/任職記錄。若將這些資料 embed 成 RAG chunks：
+
+| 問題 | 原因 |
+|------|------|
+| **語義搜索無法精確匹配** | "A020 有幾個董事" → 搜索 embedding 找不到精確數字，只找到相似文字片段 |
+| **無法做聚合查詢** | "本月有幾間 AR 到期" → RAG 沒有 COUNT / DATE range 能力 |
+| **跨公司資料污染** | chunk 切塊後，陳大文在 A020 的記錄可能混入 B197 的查詢結果 |
+| **資料即時性問題** | 每次更新都需要重新 embed，有 sync 延遲 |
+
+**正確做法：CSA 業務資料用 Tool Calling（Text-to-SQL），不進 Knowledge Base。**
+
+唯一放進 Knowledge Base 的是 **CSA_DATABASE.md**（本手冊），讓 LLM 理解 schema 結構，才能生成正確 SQL。
+
+---
+
+### 架構設計
+
+```
+用戶問題（自然語言）
+        │
+        ▼
+  Dify Agent（LLM，Qwen2.5-72B）
+        │
+        ├─ 問題含具體公司/人名/日期？
+        │         │
+        │         ▼
+        │   呼叫 Tool: query_csa
+        │         │
+        │         ▼
+        │   FastAPI middleware（Python）
+        │         ├── 接收自然語言問題
+        │         ├── LLM 參考 schema → 生成 T-SQL
+        │         ├── 安全檢查（只允許 SELECT，攔截敏感欄位）
+        │         ├── pyodbc → localhost\SQLEXPRESS → CSA_Latest
+        │         └── 回傳 JSON 結果
+        │
+        └─ 問題屬程序/法規類？
+                  │
+                  ▼
+            Knowledge Base（RAG）
+            procedures/ regulations/ fees/
+```
+
+**LLM 自動判斷走哪條路，無需人手設規則。** 判斷依據是 Tool 的 description（見下節）。
+
+---
+
+### 關鍵一：Dify Tool 定義
+
+在 Dify → Tools → Custom Tools 中新增：
+
+```yaml
+# OpenAPI schema for CSA query tool
+openapi: 3.1.0
+info:
+  title: CSA Database Query
+  version: 1.0.0
+paths:
+  /query:
+    post:
+      operationId: query_csa
+      summary: >
+        查詢 CSA 公司秘書管理系統的即時資料庫，包括：
+        公司基本資料（名稱、公司號、成立日期、狀態）、
+        現任或歷任董事、公司秘書、股東持股比例、
+        Annual Return / AGM / Business Registration 到期日、
+        股份類別及已發行股數、公司聯絡人及地址。
+        當用戶問及某特定公司（CLIENTID 或公司名）或
+        某特定人物（董事、股東、秘書）的具體實時資料時，
+        必須呼叫此工具。不適用於查詢程序知識或法規條文。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                question:
+                  type: string
+                  description: 用戶的自然語言問題
+              required: [question]
+      responses:
+        '200':
+          description: 查詢結果（JSON 陣列）
+```
+
+**description 是決策關鍵**：LLM 讀完 description 就知道「有具體公司/人名/日期的問題」要呼叫此 Tool。
+
+---
+
+### 關鍵二：FastAPI Middleware
+
+```python
+# csa_query_api.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import pyodbc, openai, json, re
+
+app = FastAPI()
+
+# 禁止輸出的敏感欄位（在 SELECT 清單中攔截）
+BLOCKED_COLUMNS = {"EREGPW", "EWEBPW", "ESIGNPW", "USERPW", "IDNUM", "PASSPORT"}
+
+# SQL Server 連線（只讀帳號）
+CONN_STR = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=localhost\\SQLEXPRESS;"
+    "DATABASE=CSA_Latest;"
+    "Trusted_Connection=yes;"
+    "TrustServerCertificate=yes;"
+)
+
+# LLM 用於生成 SQL（本機 vLLM / llama-server）
+llm = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="none")
+
+# CSA schema 摘要（注入 LLM prompt）
+CSA_SCHEMA_SUMMARY = """
+CSA_Latest 資料庫核心表（T-SQL，SQL Server 2025）：
+- CLIENT(CLIENTID, NAME_1, NAME_C, COMNUM, JURISD, COMSTA, ISACTIVE, INCDATE, DISDATE, LASTAGM, LASTAR, ARSCH, STAFF)
+- ENTITY(ENTITYID, SNUM, TYPE, NAME_1, NAME_1C, BIRTHDAY, OCC, NAT)
+- MASTER(CLIENTID, MTYPE, ENTITYID, SNUM, SINCEDATE, TILLDATE)
+  MTYPE: 11D=Director, 13S=Secretary, 01M=Shareholder, 45S=Significant Controller
+- CLISHA(CLIENTID, CLASSID, DES, PAR, XSHARES, ASHARES, ISHARES)
+- MEMSHA(CLIENTID, MTYPE, ENTITYID, CLASSID, SHARES)
+- ANNRTN(CLIENTID, NEXTARD) — Annual Return 下次到期日
+- BUSREG(CLIENTID, BUSDUE) — Business Registration 到期日
+- AGMMIN(CLIENTID, AGMDTE) — AGM 日期
+- MTPDEF(MTYPE, DES) — 角色代碼對照表
+- JURISD(JURISD, DESCRIPT, ISO_2) — 司法管轄區
+注意：無 Foreign Key，靠 CLIENTID / ENTITYID / MTYPE 關聯。日期為 datetime2。
+只能用 SELECT，禁止 INSERT/UPDATE/DELETE/DROP。
+"""
+
+
+class QueryRequest(BaseModel):
+    question: str
+
+
+def is_safe_sql(sql: str) -> bool:
+    """只允許 SELECT，阻擋任何寫入或破壞性操作"""
+    sql_upper = sql.strip().upper()
+    if not sql_upper.startswith("SELECT"):
+        return False
+    forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "EXEC", "EXECUTE", "XP_"]
+    return not any(kw in sql_upper for kw in forbidden)
+
+
+def mask_sensitive_columns(sql: str) -> str:
+    """把敏感欄位替換成 NULL AS 欄位名"""
+    for col in BLOCKED_COLUMNS:
+        # 用正則替換 SELECT 清單中的敏感欄位
+        sql = re.sub(
+            rf'\b{col}\b',
+            f"NULL AS {col}",
+            sql,
+            flags=re.IGNORECASE
+        )
+    return sql
+
+
+def generate_sql(question: str) -> str:
+    """呼叫本機 LLM 把自然語言問題轉成 T-SQL"""
+    resp = llm.chat.completions.create(
+        model="Qwen/Qwen2.5-72B-Instruct",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    f"你是 CSA 資料庫的 SQL 生成助手。\n"
+                    f"以下是資料庫 schema：\n{CSA_SCHEMA_SUMMARY}\n"
+                    "請根據用戶問題生成一條正確的 T-SQL SELECT 語句。\n"
+                    "只輸出 SQL，不要解釋，不要 markdown code block。\n"
+                    "TILLDATE IS NULL 代表現任。結果限制 TOP 50 防止過大輸出。"
+                )
+            },
+            {"role": "user", "content": question}
+        ],
+        temperature=0.0,
+        max_tokens=512
+    )
+    return resp.choices[0].message.content.strip()
+
+
+@app.post("/query")
+def query_csa(req: QueryRequest):
+    sql = generate_sql(req.question)
+
+    if not is_safe_sql(sql):
+        raise HTTPException(status_code=400, detail=f"生成的 SQL 不安全，已拒絕執行：{sql}")
+
+    sql = mask_sensitive_columns(sql)
+
+    try:
+        conn = pyodbc.connect(CONN_STR)
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        columns = [col[0] for col in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SQL 執行錯誤：{e}\nSQL: {sql}")
+
+    return {"sql": sql, "rows": rows, "count": len(rows)}
+```
+
+啟動方式：
+```powershell
+pip install fastapi uvicorn pyodbc openai
+uvicorn csa_query_api:app --host 0.0.0.0 --port 7788
+```
+
+Dify Tool 的 Server URL 填 `http://localhost:7788`。
+
+---
+
+### 關鍵三：LLM 需要的 Schema 上下文
+
+LLM 生成 SQL 時需要知道表結構。做法有兩種，**二選一**：
+
+| 做法 | 優點 | 缺點 |
+|------|------|------|
+| **A. 硬編碼在 middleware System Prompt**（上面 `CSA_SCHEMA_SUMMARY`） | 無需額外配置 | 更新 schema 需改程式碼 |
+| **B. 把 CSA_DATABASE.md 放進 Dify Knowledge Base** | Dify 自動 RAG 注入 schema 到 LLM context | 需要 Dify 支援 Tool + Knowledge Base 同時使用 |
+
+**推薦做法 A**：middleware 自帶 schema summary，簡單可靠。CSA_DATABASE.md 可同時放進 Knowledge Base 供一般知識查詢（如"MTYPE 11D 是什麼意思？"），兩者互不干擾。
+
+---
+
+### 安全邊界
+
+| 威脅 | 防禦 |
+|------|------|
+| **LLM 生成 DELETE/UPDATE** | `is_safe_sql()` — SQL 不以 SELECT 開頭即拒絕 |
+| **敏感欄位外洩**（密碼、身份證、護照） | `mask_sensitive_columns()` — 自動替換為 NULL |
+| **無限大結果集** | SQL prompt 要求加 `TOP 50` |
+| **SQL Injection（LLM 幻覺）** | 用 `pyodbc` parameterized-ready 執行，LLM 生成的 SQL 只走只讀連線 |
+| **連線帳號權限** | 建議用 Windows Auth 只讀帳號，或 SQL 帳號只授 `SELECT` 權限 |
+
+建立只讀 SQL 帳號（可選）：
+```sql
+CREATE LOGIN csa_readonly WITH PASSWORD = 'StrongPassword!';
+USE CSA_Latest;
+CREATE USER csa_readonly FOR LOGIN csa_readonly;
+EXEC sp_addrolemember 'db_datareader', 'csa_readonly';
+```
+
+---
+
+### 對話範例
+
+**範例 1：查具體公司**
+```
+用戶：A020 公司現在有幾個董事？
+LLM 判斷：有具體 CLIENTID → 呼叫 query_csa Tool
+生成 SQL：
+  SELECT TOP 50 e.NAME_1, e.NAME_1C, m.SINCEDATE
+  FROM MASTER m
+  JOIN ENTITY e ON m.ENTITYID = e.ENTITYID AND m.SNUM = e.SNUM
+  WHERE m.CLIENTID = 'A020'
+    AND m.MTYPE = '11D'
+    AND m.TILLDATE IS NULL
+  ORDER BY m.SINCEDATE
+回覆：A020 公司現時有 2 位董事：CHAN TAI MAN（陳大文，2018年起）、LEE SIU MING（李小明，2021年起）
+```
+
+**範例 2：聚合查詢**
+```
+用戶：下個月有幾間公司 Annual Return 到期？
+生成 SQL：
+  SELECT TOP 50 c.CLIENTID, c.NAME_1, a.NEXTARD
+  FROM ANNRTN a
+  JOIN CLIENT c ON a.CLIENTID = c.CLIENTID
+  WHERE a.NEXTARD >= DATEADD(month, DATEDIFF(month, 0, GETDATE()) + 1, 0)
+    AND a.NEXTARD < DATEADD(month, DATEDIFF(month, 0, GETDATE()) + 2, 0)
+  ORDER BY a.NEXTARD
+回覆：下個月共有 12 間公司 Annual Return 到期，最早是 B197 (2026-05-03)...
+```
+
+**範例 3：法規問題 → 走 RAG，不呼叫 Tool**
+```
+用戶：香港私人公司最少要有幾個董事？
+LLM 判斷：法規概念，無具體公司 → 查 Knowledge Base（regulations/）
+回覆：根據《公司條例》第 79 條，香港私人公司最少須有 1 名董事...
+```
+
+**範例 4：混合查詢（同時呼叫 Tool + RAG）**
+```
+用戶：Annual Return 要提交什麼？A020 幾時到期？
+LLM 同時：
+  ① RAG → procedures/ 找 AR 程序說明
+  ② Tool → 查 ANNRTN WHERE CLIENTID='A020'
+回覆：Annual Return 需提交 NAR1 表格...（RAG 結果）
+      A020 的 Annual Return 下次到期日為 2026-08-15。（Tool 結果）
+```
+
+---
+
+### Dify Agent 配置要求
+
+| 設定項 | 值 |
+|--------|-----|
+| **應用類型** | Agent（不是普通 Chatbot） |
+| **模型** | Qwen2.5-72B-Instruct（需支援 Function Calling） |
+| **llama-server 啟動參數** | 需加 `--jinja`（啟用 function calling template） |
+| **vLLM 啟動** | 預設支援，無需額外參數 |
+| **Tools** | query_csa（Custom Tool，server: localhost:7788） |
+| **Knowledge Bases** | procedures/ + regulations/ + fees/ + CSA_DATABASE.md |
+| **Max Iterations** | 3（防止 Tool 無限循環） |
+
+llama-server 啟用 Function Calling：
+```powershell
+.\llama-server.exe `
+  -m qwen2.5-72b-instruct-Q8_0.gguf `
+  --host 0.0.0.0 --port 8080 `
+  -ngl 99 --jinja `
+  -c 8192 --parallel 4
+```
+
+---
+
 *本方案書由 GitHub Copilot 協助整理，最終決策請結合公司實際情況評估。*
 *第 13 節於 2026 年 4 月 18 日更新；第 13.8 節於 2026 年 4 月 19 日新增（參考 jason-effi-lab/karpathy-llm-wiki-vault）。*
 *第 13.9–13.11 節於 2026 年 4 月 19 日新增（硬件模型選型、Tool Use、llama-server Windows 並發）。*
 *第 13.12 節於 2026 年 4 月 19 日新增（兩條 Ingest 路徑串聯 Dify RAG 全局架構圖）。*
 *第 13.13 節於 2026 年 4 月 19 日新增（路徑 B 上傳後確保 LLM 讀懂的三個配置：Chunking / Metadata / System Prompt）。*
 *第 13.14 節於 2026 年 4 月 19 日新增（WSL2 + vLLM 效能上頂部署方案：PagedAttention / FP8 / Docker 部署）。*
+*第 13.15 節於 2026 年 4 月 19 日新增（CSA Text-to-SQL：Dify Tool Calling 直查 SQL Server，含安全邊界、FastAPI middleware、對話範例）。*
