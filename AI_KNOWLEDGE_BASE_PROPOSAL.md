@@ -1236,7 +1236,7 @@ messages.append({"role": "tool", "content": cr_api_result})
 
 ### 13.11 Windows 並發部署：llama-server
 
-> **Windows 不支援 vLLM，但 `llama-server`（llama.cpp 內建）是完整替代方案。**
+> **Windows 不原生支援 vLLM，但可透過 WSL2 + Docker 取得完整 vLLM 體驗（見 13.14 節）。`llama-server`（llama.cpp 內建）則是最簡部署方案，適合快速上線。**
 
 #### 為什麼不用 Ollama 做並發
 
@@ -1275,13 +1275,14 @@ llama-server.exe ^
 
 | | Ollama | llama-server | vLLM |
 |--|:--:|:--:|:--:|
-| Windows 原生 | ✅ | ✅ | ❌ |
+| Windows 原生 | ✅ | ✅ | ❌（WSL2/Docker） |
 | 真正並發 | ⚠️ 可設定但效率較低 | ✅ | ✅ |
 | Continuous batching | ❌ | ✅ | ✅ |
+| PagedAttention | ❌ | ❌ | ✅ |
 | OpenAI 兼容 API | ✅ | ✅ | ✅ |
 | Function Calling | ✅ | ✅ `--jinja` | ✅ |
 | 效能 vs vLLM | — | ~80-90% | 100% |
-| 設定複雜度 | 極簡 | 簡單 | 需要 Linux |
+| 設定複雜度 | 極簡 | 簡單 | 中等（WSL2+Docker） |
 
 #### Python 呼叫方式（完全不變）
 
@@ -1551,8 +1552,186 @@ LLM 讀不讀懂路徑 B 的 Wiki 頁面？
 
 ---
 
+### 13.14 效能上頂：WSL2 + vLLM 部署方案
+
+> llama-server 可以快速上線，但若要榨取 RTX Pro 6000 Blackwell 96GB 的全部性能，**WSL2 + vLLM 是正確的升級路線**。以下分析為什麼值得直接上 vLLM，以及實際部署步驟。
+
+---
+
+#### 為什麼 WSL2 + vLLM 不是「將就」，而是「上頂」
+
+##### 1. PagedAttention — 最關鍵的差距
+
+llama-server 的並發模式是固定 slot：`--parallel 8` 代表預留 8 個完整 context window 的 KV cache。72B Q8_0 佔 ~77GB VRAM，剩 ~19GB 給 KV cache，固定分 8 份 = 每 slot 只有 ~2.4GB，能支撐的 context 長度極有限。
+
+vLLM 的 PagedAttention 把 KV cache 像虛擬記憶體一樣分頁管理：
+- **動態分配**：用多少佔多少，不用的馬上釋放
+- **無碎片浪費**：記憶體利用率接近 100%
+- **同樣 19GB 剩餘 VRAM**，可服務更多並發請求、更長 context
+
+```
+llama-server（固定 slot）：
+  77GB 模型 + [ slot1 2.4GB | slot2 2.4GB | ... | slot8 2.4GB ] = 96GB
+  → 每人只有 ~2.4GB KV cache
+  → 長對話時快速用完
+
+vLLM（PagedAttention）：
+  77GB 模型 + [ 動態分頁池 19GB ]
+  → 短對話用 0.5GB，長對話用 5GB，自動調整
+  → 同樣 19GB 可服務更多人
+```
+
+##### 2. WSL2 GPU 性能幾乎零損耗
+
+WSL2 的 GPU passthrough 不是模擬，而是 CUDA kernel 直接在 GPU 硬件上執行：
+- **VRAM**：100% 可用（96GB 全部給 WSL2 內的 vLLM）
+- **計算**：~98% 原生效能（差距來自 driver 層的微量開銷）
+- **瓶頸不在 GPU**：LLM 推理的瓶頸是 GPU 記憶體頻寬，WSL2 不影響這部分
+
+##### 3. Blackwell 架構原生優勢
+
+RTX Pro 6000 Blackwell 支援硬體 FP8 運算。vLLM 原生支援 FP8 量化：
+
+| 量化方式 | 模型大小 | 剩餘 VRAM 給 KV cache | 來源 |
+|---------|---------|---------------------|------|
+| GGUF Q8_0 (llama-server) | ~77GB | ~19GB | llama.cpp 社區量化 |
+| HuggingFace FP8 (vLLM) | ~72GB | ~24GB | 硬體原生精度 |
+
+FP8 不是「壓縮後的近似」，而是 Blackwell GPU 原生支援的運算精度，精確度損失極小。用 vLLM + FP8 同時獲得：更小模型 + 更多 KV cache 空間 + 硬體加速。
+
+##### 4. vLLM 也支援 GGUF
+
+vLLM 從 v0.5.0 起支援直接載入 GGUF 格式模型（見官方文件 [GGUF Quantization](https://docs.vllm.ai/en/latest/features/quantization/gguf.html)）。這意味着：
+- 可以直接使用已下載的 `qwen2.5-72b-instruct-Q8_0.gguf`
+- 無需重新下載 HuggingFace 格式
+- 遷移時零成本切換
+
+---
+
+#### 實際部署：Docker 一行啟動
+
+##### 前置條件
+
+1. **Windows 11**（WSL2 已內建）
+2. **NVIDIA 驅動**：安裝 Windows 版 NVIDIA 驅動（≥ R570 以支援 CUDA 12.8+ / Blackwell）
+3. **Docker Desktop**：啟用 WSL2 backend（安裝時預設選項）
+4. **.wslconfig 調整記憶體**（`%UserProfile%\.wslconfig`）：
+
+```ini
+[wsl2]
+memory=32GB          # LLM 推理主要吃 VRAM，系統 RAM 給 32GB 足夠
+swap=8GB
+localhostForwarding=true
+networkingMode=mirrored  # Windows 11 支援，讓 WSL2 port 直接可從 Windows 存取
+```
+
+##### Docker 啟動 vLLM（使用現有 GGUF）
+
+```bash
+docker run --gpus all \
+  -v /mnt/c/Models:/models \
+  -p 8000:8000 \
+  --ipc=host \
+  vllm/vllm-openai:latest \
+  --model /models/qwen2.5-72b-instruct-Q8_0.gguf \
+  --gpu-memory-utilization 0.95 \
+  --max-model-len 8192
+```
+
+##### Docker 啟動 vLLM（使用 HuggingFace FP8，推薦）
+
+```bash
+docker run --gpus all \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -p 8000:8000 \
+  --ipc=host \
+  vllm/vllm-openai:latest \
+  --model Qwen/Qwen2.5-72B-Instruct \
+  --quantization fp8 \
+  --gpu-memory-utilization 0.95 \
+  --max-model-len 8192
+```
+
+##### 呼叫方式（與 llama-server 完全相同）
+
+```python
+import openai
+
+client = openai.OpenAI(
+    base_url="http://localhost:8000/v1",  # port 8000（vLLM 預設）
+    api_key="none"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen2.5-72B-Instruct",
+    messages=[{"role": "user", "content": "你好"}]
+)
+```
+
+Dify 連接時只需改 `base_url` port 即可，其餘配置不變。
+
+---
+
+#### llama-server vs WSL2 + vLLM：JCK 場景實際對比
+
+| 維度 | llama-server | WSL2 + vLLM |
+|------|-------------|-------------|
+| **部署難度** | 解壓即用（5 分鐘） | Docker Desktop + 拉 image（30 分鐘） |
+| **記憶體管理** | 固定 slot，VRAM 利用率 ~60-80% | PagedAttention，VRAM 利用率 ~95%+ |
+| **8 人同時問問題** | 勉強撐住，context 長度受限 | 輕鬆應對，動態分配 KV cache |
+| **長對話（8K+ tokens）** | 可能觸發 OOM | 優雅降級，不會崩潰 |
+| **量化選項** | 僅 GGUF | GGUF + FP8 + AWQ + GPTQ + INT8 |
+| **Speculative Decoding** | 不支援 | 支援（可加速 1.5-2x 生成速度） |
+| **維護複雜度** | Windows 原生，零依賴 | 需 Docker Desktop 常駐 |
+| **社群 / 更新頻率** | llama.cpp 活躍 | vLLM v0.19.1，77K stars，極活躍 |
+| **Dify 官方整合** | 自行配 OpenAI-compatible | [官方文件](https://docs.vllm.ai/en/latest/deployment/frameworks/dify/) 有指引 |
+| **故障排除** | 簡單（單一 exe） | 需基本 Docker/Linux 知識 |
+
+---
+
+#### 推薦策略：直接上 vLLM，保留 llama-server 作 fallback
+
+```
+部署架構：
+
+  Windows 11 主機
+  ├── Docker Desktop（WSL2 backend）
+  │   └── vllm/vllm-openai container
+  │       ├── Qwen2.5-72B-Instruct FP8  ← 主力推理引擎
+  │       └── port 8000 → Dify 連接
+  │
+  └── llama-server.exe（Windows 原生）
+      ├── qwen2.5-72b-instruct-Q8_0.gguf  ← 備用
+      └── port 8080 → 緊急 fallback
+
+日常運作：
+  Dify → http://localhost:8000/v1  → vLLM（PagedAttention 全速）
+
+Docker 出問題時：
+  Dify → http://localhost:8080/v1  → llama-server（即時切換，零停機）
+```
+
+**為什麼不純用 llama-server？** 50 人公司，尖峰時段可能 5-15 人同時查詢。PagedAttention 在這個並發量下的 KV cache 利用率差距，直接決定「能不能用」和「用得順不順」。
+
+**為什麼保留 llama-server？** Docker Desktop 更新或 WSL2 異常時（Windows Update 偶發），有原生 exe 可立即頂上，不影響業務。
+
+---
+
+#### WSL2 + vLLM 的已知注意事項
+
+| 項目 | 說明 | 解法 |
+|------|------|------|
+| WSL2 RAM 預設 50% | `.wslconfig` 預設只分系統記憶體的一半 | 設定 `memory=32GB`（LLM 吃 VRAM，不吃 RAM） |
+| 模型檔案位置 | 放 `/mnt/c/` 跨檔案系統讀取較慢 | 首次載入稍慢（~1 分鐘），載入後全在 VRAM，不影響推理速度 |
+| Docker Desktop 佔資源 | 常駐約 1-2GB RAM | 對 LLM 伺服器而言可忽略 |
+| CUDA 版本 | Blackwell 需要 CUDA ≥ 12.8 | vLLM Docker image 已內建 CUDA 12.9，無需手動安裝 |
+| 網路 | WSL2 NAT 模式需 port forwarding | 使用 `networkingMode=mirrored`（Windows 11），port 直通 |
+
+---
+
 *本方案書由 GitHub Copilot 協助整理，最終決策請結合公司實際情況評估。*
 *第 13 節於 2026 年 4 月 18 日更新；第 13.8 節於 2026 年 4 月 19 日新增（參考 jason-effi-lab/karpathy-llm-wiki-vault）。*
 *第 13.9–13.11 節於 2026 年 4 月 19 日新增（硬件模型選型、Tool Use、llama-server Windows 並發）。*
 *第 13.12 節於 2026 年 4 月 19 日新增（兩條 Ingest 路徑串聯 Dify RAG 全局架構圖）。*
 *第 13.13 節於 2026 年 4 月 19 日新增（路徑 B 上傳後確保 LLM 讀懂的三個配置：Chunking / Metadata / System Prompt）。*
+*第 13.14 節於 2026 年 4 月 19 日新增（WSL2 + vLLM 效能上頂部署方案：PagedAttention / FP8 / Docker 部署）。*
