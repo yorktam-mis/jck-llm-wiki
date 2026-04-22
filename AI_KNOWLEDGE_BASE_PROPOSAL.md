@@ -2055,6 +2055,326 @@ llama-server 啟用 Function Calling：
 
 ---
 
+## 13.16 Email LLM Wiki + 企業 RBAC 架構預備設計（開發前準備）
+
+> 本節根據 2026 年 4 月與 AI 系統的深度討論整理，記錄在正式開發 Email LLM Wiki 前必須釐清的架構決策、權限設計原則與安全邊界。所有技術規格已對照官方資料核實。
+
+---
+
+### 13.16.1 核心架構原則：讀寫分離（Ingest/Lint 脫離 Dify）
+
+Email LLM Wiki 的讀寫操作必須嚴格分開，Dify 只負責 Query 一環：
+
+| 職責 | 執行者 | 原因 |
+|------|--------|------|
+| **Ingest**（新郵件 → Markdown） | Python 守護程序 + 本地 vLLM | Dify Workflow 為同步響應設計，批量長時間任務容易超時崩潰 |
+| **Lint**（每夜知識庫整理） | Python 排程腳本 + 本地 vLLM | 需滿載 GPU 算力，在 Dify 內除錯困難 |
+| **Query**（員工查詢） | Dify Chatflow + Custom Tool | Dify 擅長調度對話、可視化流程、快速迭代 Prompt |
+
+**Ingest 流程（Python 控制）：**
+
+```
+[郵件服務器 IMAP/Exchange]
+    → Python Daemon：提取郵件為純文字，剔除 HTML/簽名/免責聲明
+    → 呼叫本地 vLLM（Qwen3.6-35B-A3B）：合併入對應客戶 .md 檔案
+    → 寫入磁碟（/wiki/clients/<客戶名>.md）
+    → （可選）通知 Dify Dataset API 更新向量索引
+```
+
+**Lint 流程（每夜 cron）：**
+遍歷所有 `.md` 檔案，交給 vLLM 檢查邏輯矛盾、修復格式、標記過時資訊，並更新 `last_linted` 時間戳。
+
+---
+
+### 13.16.2 Dify 作為 Query 框架的正確姿勢
+
+Dify 在此系統中**不使用**傳統切片 RAG，而是透過 Custom Tool 讀取完整 Markdown 文件，充分發揮 Qwen3.6-35B-A3B 的長上下文能力。
+
+**FastAPI 橋接服務（極簡實現）：**
+
+```python
+# wiki_api.py — 運行於本地，供 Dify Custom Tool 呼叫
+from fastapi import FastAPI
+import os
+
+app = FastAPI()
+WIKI_BASE = "/data/wiki"
+
+@app.get("/api/read_wiki")
+def read_wiki(client_name: str, user_id: str):
+    # 權限驗證由 Python 負責（見 13.16.3）
+    if not check_permission(user_id, client_name):
+        return {"error": "權限不足，無法讀取此客戶資料"}
+    path = os.path.join(WIKI_BASE, f"{client_name}.md")
+    if not os.path.exists(path):
+        return {"content": f"找不到 {client_name} 的資料，可能尚未建立 Wiki。"}
+    with open(path, encoding="utf-8") as f:
+        return {"content": f.read()}
+```
+
+**Dify Custom Tool 描述（餵給 LLM 判斷何時調用）：**
+
+```yaml
+name: read_client_wiki
+description: |
+  當用戶詢問特定客戶的歷史往來、需求變更、項目進度或郵件溝通記錄時，
+  調用此工具並輸入客戶名稱，獲取該客戶完整的 Markdown 百科檔案。
+  不適用於通用法規查詢或 FAQ 問答。
+parameters:
+  client_name:
+    type: string
+    description: 客戶公司名稱（精確匹配）
+```
+
+**為何優於傳統 RAG：**
+Qwen3.6-35B-A3B 原生支援 262,144 token 上下文（使用 YaRN 擴展可達約 1,010,000 token），可一次讀入整份客戶 Markdown 而不丟失跨時間線關聯，避免切片 RAG 拼接碎片的失真風險。
+
+---
+
+### 13.16.3 Python Middleware RBAC（不讓 LLM 判斷權限）
+
+**核心鐵律：LLM 只判斷意圖，Python 負責守門。**
+
+員工從 Web 前台提問的完整路徑：
+
+```
+員工登入 Web → Web 後端驗證 JWT/Session
+  → 呼叫 Dify Chat API（附帶 user_id）
+  → Dify Chatflow：LLM 判斷意圖 → 呼叫 Custom Tool read_wiki
+  → Python API 查 CSA SQL 驗證權限
+    → 有權：讀取 .md，返回內容 → LLM 根據內容生成回答
+    → 無權：返回拒絕訊息 → LLM 回覆「您沒有權限查詢此客戶」
+```
+
+**Python 驗權核心邏輯（概念）：**
+
+```python
+def check_permission(user_id: str, client_name: str) -> bool:
+    # 1. 從 CSA 查詢員工在職狀態與負責客戶清單
+    result = query_csa(
+        "SELECT is_active, client_name FROM Staff_Client_Map "
+        "WHERE user_id = ? AND client_name = ?",
+        (user_id, client_name)
+    )
+    # 2. 嚴格比對，不在名單或已離職一律拒絕
+    return bool(result and result["is_active"])
+```
+
+**安全特性：**
+- LLM 從未收到它「無法看」的資料，Prompt Injection 無從套取機密
+- 員工離職後，CSA 資料庫狀態更新即生效，無需改任何 AI 代碼
+- 所有 API 呼叫記錄寫入 Audit Log（`user_id` + 查詢客戶 + 回傳結果 + 時間戳）
+
+---
+
+### 13.16.4 VIP 客戶雙軌物理隔離
+
+單靠代碼邏輯仍有 Bug 風險，VIP 客戶須在**作業系統層**實施物理隔離：
+
+**Linux OS 雙用戶架構：**
+
+```bash
+# 創建兩個 OS 用戶，各自擁有獨立目錄
+useradd user_general    # 讀寫 /data/wiki_general/  （普通客戶）
+useradd user_vip        # 讀寫 /data/wiki_vip/      （VIP 客戶）
+
+# user_general 在 OS 層無法讀取 /data/wiki_vip/
+# 即使代碼有 Bug，物理權限仍阻止跨界存取
+chmod 700 /data/wiki_vip
+chown user_vip:user_vip /data/wiki_vip
+```
+
+**雙軌 Pipeline 對照：**
+
+| | 普通軌道 | VIP 專軌 |
+|-|---------|---------|
+| 執行 OS 用戶 | `user_general` | `user_vip` |
+| 郵件來源 | 普通客戶郵箱 | VIP 客戶郵箱（獨立加密存儲） |
+| 寫入目錄 | `/data/wiki_general/` | `/data/wiki_vip/` |
+| 跨目錄讀取 | ❌ OS 層硬性禁止 | ❌ OS 層硬性禁止 |
+| vLLM 實例 | ✅ 共用同一台 GB10（模型無狀態） | ✅ 共用同一台 GB10（模型無狀態） |
+
+> **模型無狀態說明：** vLLM 每次請求完成後立即清空 KV Cache，A 客戶資料不會殘留影響 B 客戶的請求，兩條 Pipeline 可安全共用同一個推理引擎。
+
+**VIP 額外驗證（代碼層）：**
+
+```python
+# wiki_api.py — VIP 雙重鎖
+if client.is_vip:
+    if not check_vip_clearance(user_id):
+        return {"error": "需要 VIP 查閱許可（VIP Clearance），請聯繫主管申請"}
+    path = f"/data/wiki_vip/{client_name}.md"
+else:
+    path = f"/data/wiki_general/{client_name}.md"
+```
+
+---
+
+### 13.16.5 CSA 作為身份來源 + AI 權限覆蓋層
+
+**CSA 的角色（只讀）：** 提供「這個人是誰、所屬部門、是否在職、負責哪些客戶」。
+
+**新建 `AI_Permissions` 覆蓋層（不改動 CSA 現有結構）：**
+
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `dept_code` | VARCHAR | 部門代碼（對應 CSA 部門） |
+| `ai_scope` | VARCHAR | 可查客戶範疇：`own`（只限自己負責）/`dept`（整個部門）/`all` |
+| `wiki_tags_allowed` | VARCHAR | 可讀取的知識標籤（如 `cosec,tax,pricing`） |
+| `vip_clearance` | BIT | VIP 查閱許可（預設 False，需主管手動開啟） |
+| `public_wiki_access` | BIT | 可查公共法規庫（`/wiki_public/`） |
+
+**動態效果：**
+- HR 在 CSA 更新員工狀態 → Python 即時讀取最新 → 無需改任何代碼
+- VIP Clearance 獨立管理，不依賴 CSA 現有欄位，避免改動遺留系統
+
+---
+
+### 13.16.6 知識庫分層（公私分明）
+
+除機密的客戶私有庫外，設立公共知識庫讓通用知識全員可查：
+
+| 目錄 | 內容 | 存取控制 |
+|------|------|---------|
+| `/wiki/clients/` | 含真實客戶名稱、金額、往來記錄的完整 Markdown | 嚴格 RBAC（Python SQL 驗權） |
+| `/wiki/vip/` | VIP 客戶完整檔案（OS 層物理隔離） | VIP Clearance 雙重鎖 |
+| `/wiki/public/` | 去識別化的通用業務見解、法規應對案例 | 全體員工可讀 |
+
+**Ingest 時自動生成公共庫版本（去識別化）：**
+
+Ingest Python Daemon 在寫完私有庫後，額外呼叫 vLLM：
+
+```
+System Prompt：
+你是資料脫敏助手。根據以下客戶郵件，提取通用業務見解和法規應對經驗。
+去除所有客戶名稱、人名、具體金額、日期等可識別資訊。
+以匿名案例格式輸出（如「某 BVI 公司轉股案例」），供公司知識庫分享。
+```
+
+**效果：** 解決「SQL 守太嚴 LLM 拿不到足夠背景、SQL 放太鬆又有機密外洩風險」的矛盾——通用知識走公共庫，機密細節走私有庫。
+
+---
+
+### 13.16.7 對外聯網查詢的隱私保護（Query Sanitisation）
+
+員工詢問外部法規時，系統須確保客戶名稱**絕對不隨搜尋詞洩露**：
+
+**Dify Workflow 強制脫敏流程（節點設計）：**
+
+```
+用戶問題（含客戶名）
+  → Node 1：意圖識別 LLM
+      輸出：{"intent": "legal_query", "client": "Apex Capital", "topic": "BVI 轉股稅務"}
+  → Node 2：脫敏 LLM（System Prompt：提取純知識關鍵字，嚴禁包含真實公司名、人名、金額）
+      輸入："Apex Capital BVI 轉股 2026 稅務影響"
+      輸出："BVI 公司轉股 2026 稅務法規 影響"（客戶名已清除）
+  → Node 3：Tavily/Google 聯網搜尋（只收到脫敏關鍵字）
+  → Node 4：read_client_wiki（用原始 client 名稱，在內網查，不外傳）
+  → Node 5：融合 LLM（結合外部法規 + 本地客戶檔案 → 生成回答）
+```
+
+**Python 硬攔截（最後保障）：**
+
+```python
+# 每次呼叫外部 API 前強制過濾
+def sanitize_query(query: str) -> str:
+    client_names = load_client_names_from_csa()  # 每日從 CSA 同步快取
+    for name in client_names:
+        if name.lower() in query.lower():
+            raise PrivacyViolationError(
+                f"搜尋詞包含客戶名稱「{name}」，已攔截，請通報系統管理員"
+            )
+    return query
+```
+
+---
+
+### 13.16.8 縱深防禦（Defense-in-Depth）安全模型
+
+不追求「完美防禦」，而是以多層疊加實現「損害控制」：
+
+| 防線 | 機制 | 攔截效果 |
+|------|------|---------|
+| **Layer 1**（物理隔離） | Linux OS 用戶權限 + 雙軌 Pipeline | 攔截 99% 跨權限存取 |
+| **Layer 2**（代碼守門） | Python SQL 驗權，拒絕後不傳文件給 LLM | LLM 無資料可洩露 |
+| **Layer 3**（輸出審查） | 小型模型（如 Qwen3-8B）在回答送出前掃描敏感詞 | 捕捉 Layer 2 漏網之魚 |
+| **Layer 4**（威懾） | 全量 Audit Log + 定期人工抽查 | 強化內部人員自我約束 |
+
+**Layer 3 輸出審查 Prompt（概念）：**
+```
+你是安全審查員。檢查以下即將發送給員工的文字。
+若包含具體銀行帳號、身份證號、未公開財務金額，將其替換為 [已隱藏]。
+其餘內容保持原文不變。
+```
+
+> **重要提醒：** 系統上線初期應進行灰度測試（3–5 人核心小組），收集真實使用案例與潛在翻車場景，修補後再全面推廣。
+
+---
+
+### 13.16.9 Dify 傳統 RAG 的適用場景
+
+以下場景 Dify 內建切片 RAG 才是最佳選擇，不應強行用 LLM Wiki 替代：
+
+| 場景 | 原因 |
+|------|------|
+| HR 員工手冊、IT FAQ | 問題高度具體，只需一小段答案，切片效率高 |
+| 產品技術規格書 | BM25 + 向量混合檢索確保型號精確匹配 |
+| 多格式文件批量入庫（PDF/Word/Excel） | Dify 內建 ETL 管道，開箱即用 |
+| 高並發對外客服機器人 | 只傳 2K token 給 LLM，首字回應快，算力壓力小 |
+
+**選擇準則：**
+- 問「這件事怎麼做？」→ Dify RAG（FAQ 型）
+- 問「這個客戶怎麼了？」→ LLM Wiki 全文讀入（歷史分析型）
+- 問「這個欄位等於什麼？」→ CSA Text-to-SQL（見 §13.15）
+
+---
+
+### 13.16.10 開發前 Checklist
+
+正式開始開發前，須確認以下事項：
+
+**基礎設施**
+- [ ] GB10 / 服務器安裝 Linux，創建 `user_general` 和 `user_vip` 兩個 OS 用戶
+- [ ] vLLM 部署 Qwen3.6-35B-A3B（需 `vllm>=0.19.0`），啟用 Tool Calling：
+  ```bash
+  vllm serve Qwen/Qwen3.6-35B-A3B --port 8000 \
+    --max-model-len 262144 \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder
+  ```
+- [ ] Dify 本地 Docker 部署，配置本地 vLLM 為 LLM Provider
+- [ ] FastAPI `wiki_api.py` 在本地可運行，Dify 能成功呼叫 Custom Tool
+
+**數據與權限**
+- [ ] CSA 資料庫中「員工 → 負責客戶」對應關係表確認完整且準確
+- [ ] 新建 `AI_Permissions` 覆蓋層表格（部門/職級 → AI 查詢範圍映射）
+- [ ] VIP 客戶名單確認，`VIP_Clearance` 名單建立
+- [ ] 員工 `user_id` 可從 Web System 登入 Session 可靠傳遞至 Dify
+
+**安全與合規**
+- [ ] 所有 SQL 查詢帳號設為 Read-Only（無 UPDATE/DELETE 權限）
+- [ ] Audit Log 機制確認（user_id + 查詢客戶 + 回傳結果 + 時間戳）
+- [ ] 外部聯網工具（Tavily/Google）已加 Python 客戶名稱攔截層
+- [ ] 測試：離職員工是否自動失去存取（更新 CSA → 即時生效）
+- [ ] 測試：Prompt Injection 能否繞過 Python 守門取得其他客戶資料
+
+**Ingest Pipeline**
+- [ ] 郵件清洗腳本能正確去除 HTML、簽名檔、免責聲明
+- [ ] Markdown 合併邏輯測試（新知識加入，舊知識不丟失，無重複）
+- [ ] 單一客戶 `.md` 大小估算（建議控制在 128K token 以內，保留 context 空間）
+- [ ] 郵件連接方式確認：IMAP / Exchange / `.eml` 匯出
+
+**MVP 開發順序**
+1. 寫 Python 腳本讀取單封測試郵件，呼叫 vLLM，生成標準 Markdown
+2. 寫 `wiki_api.py`（`read_wiki` + `check_permission`）
+3. 在 Dify 註冊 `read_client_wiki` 工具，端對端測試 Query 流程
+4. 完善 Ingest 合併邏輯（讀取舊頁面 + 融合新內容 + 寫回）
+5. 加入 VIP 雙軌 Pipeline 與 OS 用戶隔離
+6. 加入 Query Sanitisation（聯網搜尋脫敏攔截）
+7. Web 系統對接 Dify Chat API
+8. 灰度測試（3–5 人核心小組）→ 收集問題 → 全面推廣
+
+---
+
 *本方案書由 GitHub Copilot 協助整理，最終決策請結合公司實際情況評估。*
 *第 13 節於 2026 年 4 月 18 日更新；第 13.8 節於 2026 年 4 月 19 日新增（參考 jason-effi-lab/karpathy-llm-wiki-vault）。*
 *第 13.9–13.11 節於 2026 年 4 月 19 日新增（硬件模型選型、Tool Use、llama-server Windows 並發）。*
@@ -2062,3 +2382,4 @@ llama-server 啟用 Function Calling：
 *第 13.13 節於 2026 年 4 月 19 日新增（路徑 B 上傳後確保 LLM 讀懂的三個配置：Chunking / Metadata / System Prompt）。*
 *第 13.14 節於 2026 年 4 月 19 日新增（WSL2 + vLLM 效能上頂部署方案：PagedAttention / FP8 / Docker 部署）。*
 *第 13.15 節於 2026 年 4 月 19 日新增（CSA Text-to-SQL：Dify Tool Calling 直查 SQL Server，含安全邊界、FastAPI middleware、對話範例）。*
+*第 13.16 節於 2026 年 4 月 22 日新增（Email LLM Wiki + 企業 RBAC 架構預備設計：讀寫分離、Python Middleware 守門、VIP 雙軌物理隔離、Query Sanitisation、縱深防禦）。*
