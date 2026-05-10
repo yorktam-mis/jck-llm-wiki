@@ -2375,6 +2375,162 @@ def sanitize_query(query: str) -> str:
 
 ---
 
+## 13.17 Hermes Agent 作為 LLM Wiki 核心的可行性評估（2026-05-10）
+
+> 本節記錄對 Hermes Agent（NousResearch/hermes-agent）的深度研究結果，與 Dify 方案（§13.16）的對比，以及適合 JCK 情境的部署建議。
+
+---
+
+### 13.17.1 Hermes Agent 真實身份（重要澄清）
+
+Hermes Agent（`NousResearch/hermes-agent`，141k ★，MIT）是一個**自主 AI Agent 框架**，與 OpenClaw 同類——不是模型名稱，不是 Hugging Face 上的 Hermes-3 LLM。
+
+**核心定位**：「The agent that grows with you」—— 自我學習、自我改進的 AI Agent 運行框架。
+
+**關鍵能力（截至 v0.13.0，2026-05-07）**：
+
+| 功能 | 說明 |
+|------|------|
+| **模型無關** | 接任何 OpenAI-compatible 端點（OpenRouter、vLLM、NIM、本地 Ollama 等），`hermes model` 一鍵切換 |
+| **Skills 系統** | 可把複雜操作寫成可重用 Skill 並上傳至 agentskills.io，支援自動從任務中提煉新 Skill |
+| **Memory 系統** | 跨 session 持久記憶（MEMORY.md / USER.md），FTS5 全文搜索歷史對話 |
+| **Cron 排程** | 內建 Cron，可排定每夜 Lint 任務，自動投遞結果到任意平台 |
+| **Messaging Gateway** | 原生支援 Telegram / Discord / Slack / WhatsApp / Signal / Google Chat / Email |
+| **Subagent 並行** | 可 spawn 獨立 Subagent 處理平行工作流，結果 RPC 彙整 |
+| **MCP 支援** | 可連接任何 MCP Server 擴充工具集 |
+| **Windows 支援** | Early Beta（PowerShell 一鍵安裝），最穩定為 WSL2 |
+
+**與 OpenClaw 的關係**：Hermes Agent 支援 `hermes claw migrate`，可自動從 OpenClaw 遷移設定、記憶、Skills、API 金鑰。兩者架構同類，Hermes 是後起之秀（活躍度更高）。
+
+---
+
+### 13.17.2 Hermes Agent vs Dify（§13.16 方案）對比
+
+| 維度 | Hermes Agent | Dify（§13.16 方案）|
+|------|-------------|-------------------|
+| **底層 LLM** | 任意 OpenAI-compatible（接 vLLM+Qwen）✅ | 任意 OpenAI-compatible（接 vLLM+Qwen）✅ |
+| **Wiki 讀取** | 寫成 Skill（Python）| Custom Tool（Python）|
+| **RBAC 守門** | Skill 內 Python 查 SQL | Custom Tool 內 Python 查 SQL |
+| **每夜 Lint Cron** | ✅ 原生內建 Cron | ⚠️ 需額外 Python Daemon |
+| **跨 session 記憶** | ✅ 原生 Memory 系統 | ❌ 無（Dify 無狀態） |
+| **Telegram 查詢** | ✅ 原生 Gateway | ⚠️ 需另外接 Bot |
+| **視覺化流程編輯** | ❌ 代碼 Skill | ✅ 拖拉式 Chatflow |
+| **Web UI 包裝** | ⚠️ 需第三方（hermes-webui / hermes-web-ui）| ✅ 原生 Web UI |
+| **企業內網嵌入** | ⚠️ 需 iframe 或 API 對接 | ✅ iframe / JS SDK 直接嵌入 |
+| **維護複雜度** | 較低（框架整合度高）| 中等（各組件獨立）|
+
+**結論一**：Hermes Agent 在 Cron Lint、Telegram Gateway、跨 session 記憶三個點上原生優於 Dify；Dify 在視覺化編輯和 Web UI 嵌入上更方便。
+
+**結論二**：兩者**不建議疊加使用**——Hermes Agent 和 Dify 角色重疊（都是 agent 編排層），混合架構反而增加維護複雜度。
+
+---
+
+### 13.17.3 Hermes Agent 配合 vLLM + Qwen 的部署架構
+
+選用 Hermes Agent 作為核心時，完整架構如下：
+
+```
+[員工]
+  │
+  ├─ Telegram / WhatsApp / Slack（日常查詢）
+  │     └→ Hermes Gateway（單一 process 管理所有平台）
+  │
+  └─ JCK Web System（內網瀏覽器）
+        └→ iframe 嵌入 hermes-webui / 呼叫 Hermes HTTP API
+              │
+              ▼
+    Hermes Agent（核心）
+      ├─ Skill: read_wiki（讀 /wiki/clients/<客戶>.md）
+      ├─ Skill: check_permission（Python 查 CSA SQL）
+      ├─ Skill: query_csa（Text-to-SQL，見 §13.15）
+      ├─ Skill: sanitize_search（Query 脫敏，見 §13.16.7）
+      ├─ Cron: nightly_lint（每夜 00:00 跑 Lint Skill）
+      └─ Memory: 記住每位員工的查詢習慣和偏好
+              │
+              ▼
+    vLLM（WSL2 / Docker）
+      └→ Qwen3.6-35B-A3B（繁中 + 長 context + Tool Calling）
+```
+
+**Hermes 配置 vLLM 本地端點**：
+
+```bash
+# ~/.hermes/cli-config.yaml
+provider: openai
+openai_api_base: http://localhost:8000/v1
+openai_api_key: dummy  # vLLM 不需要真實 key
+model: Qwen/Qwen3.6-35B-A3B
+```
+
+---
+
+### 13.17.4 核心 Skill 範例（read_wiki + check_permission）
+
+Hermes Skills 是普通 Markdown 檔案，包含指令給 Agent：
+
+```markdown
+# skill: read_client_wiki
+# description: 讀取指定客戶的完整 Wiki Markdown 檔案，回傳內容供 LLM 分析
+
+## Steps
+1. 確認 {{client_name}} 參數已提供
+2. 調用 shell: python /opt/wiki_api/check_perm.py --user {{current_user}} --client {{client_name}}
+   - 若回傳 "DENIED"，回覆員工「您沒有查看此客戶資料的權限」並停止
+3. 讀取 /data/wiki/clients/{{client_name}}.md
+4. 回傳完整檔案內容給 LLM 分析
+```
+
+**RBAC 守門腳本**（Skill 呼叫的 Python）：
+
+```python
+# /opt/wiki_api/check_perm.py
+import sys, pyodbc
+
+def check(user_id: str, client: str) -> bool:
+    conn = pyodbc.connect("DSN=CSA_Latest;")
+    row = conn.execute(
+        "SELECT 1 FROM Staff_Client_Map WHERE user_id=? AND client_name=? AND is_active=1",
+        user_id, client
+    ).fetchone()
+    return row is not None
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--user"); p.add_argument("--client")
+    args = p.parse_args()
+    print("ALLOWED" if check(args.user, args.client) else "DENIED")
+```
+
+---
+
+### 13.17.5 Dify 純 UI 包裝的可行性（不建議）
+
+理論上可以：Dify 調用 Hermes Agent 的 HTTP API 作為 Custom Tool，再用 Dify Chat UI 展示。但這樣做的問題：
+
+- Dify Chatflow 的編排邏輯與 Hermes 的 agent loop 完全重複，等於兩個 orchestration 層
+- Hermes 的 Memory 和 Skills 在 Dify 層面不透明，除錯困難
+- Hermes 已有自己的 Web UI 生態（`hermes-webui`、`hermes-web-ui`、`hermes-workspace`）
+
+**正確做法**：直接用 Hermes Agent 的 HTTP API / Web UI，嵌入 JCK Web System，跳過 Dify。
+
+---
+
+### 13.17.6 選型建議（Hermes vs Dify）
+
+| 如果你的優先考量是… | 選擇 |
+|-------------------|------|
+| 員工主要用 Telegram / WhatsApp 查詢 | **Hermes Agent**（Gateway 原生，零額外開發）|
+| 需要每夜自動 Lint / 定時任務 | **Hermes Agent**（Cron 內建）|
+| 需要跨 session 記住員工偏好 | **Hermes Agent**（Memory 原生）|
+| 需要視覺化拖拉設計流程，給非技術人員配置 | **Dify** |
+| 需要精細的 Web UI 嵌入 JCK 內網 | **Dify**（SDK 更成熟）|
+| 初期 MVP 最快落地 | **Hermes Agent**（技術棧更統一，Skill 比 Custom Tool 更直接）|
+
+**JCK 情境建議**：優先評估 Hermes Agent 路徑——技術棧更統一（Python Skill + vLLM），Telegram Gateway 對 Staff 使用無摩擦，Cron Lint 和 Memory 開箱即用。如後期需要精緻的內網 Web 入口，再考慮 `hermes-webui` 或直接嵌入 JCK Web System Router。
+
+---
+
 *本方案書由 GitHub Copilot 協助整理，最終決策請結合公司實際情況評估。*
 *第 13 節於 2026 年 4 月 18 日更新；第 13.8 節於 2026 年 4 月 19 日新增（參考 jason-effi-lab/karpathy-llm-wiki-vault）。*
 *第 13.9–13.11 節於 2026 年 4 月 19 日新增（硬件模型選型、Tool Use、llama-server Windows 並發）。*
@@ -2383,3 +2539,4 @@ def sanitize_query(query: str) -> str:
 *第 13.14 節於 2026 年 4 月 19 日新增（WSL2 + vLLM 效能上頂部署方案：PagedAttention / FP8 / Docker 部署）。*
 *第 13.15 節於 2026 年 4 月 19 日新增（CSA Text-to-SQL：Dify Tool Calling 直查 SQL Server，含安全邊界、FastAPI middleware、對話範例）。*
 *第 13.16 節於 2026 年 4 月 22 日新增（Email LLM Wiki + 企業 RBAC 架構預備設計：讀寫分離、Python Middleware 守門、VIP 雙軌物理隔離、Query Sanitisation、縱深防禦）。*
+*第 13.17 節於 2026 年 5 月 10 日新增（Hermes Agent 可行性評估：與 OpenClaw 同類的自主 Agent 框架，vLLM+Qwen 接入、Skill 設計、對比 Dify 的選型建議）。*
