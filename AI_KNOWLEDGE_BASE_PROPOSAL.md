@@ -2531,6 +2531,178 @@ if __name__ == "__main__":
 
 ---
 
+## 13.18 JCK Web Poe：企業內網 AI 聊天平台最速落地方案（2026-05-10）
+
+> 本節回答：「在 JCK Web System 現有技術棧下，如何以最小代價快速實現類 Poe 的多模型 AI 聊天體驗？」
+> 關聯章節：§13.15（Text-to-SQL）、§13.16（RBAC）、§13.17（Hermes Agent）、§13.19（三階段演化路線圖）
+
+---
+
+### 13.18.1 為何不選 LobeChat
+
+LobeChat 功能完整、UI 精美，但與 JCK Web System 現有技術棧存在根本性衝突：
+
+| 衝突點 | JCK Web System | LobeChat |
+|--------|---------------|---------|
+| **語言/框架** | FastAPI + Python | Next.js（React）|
+| **Auth** | `app_auth.user_credentials`（PG）| 自己一套 Auth，需 OAuth 橋接 |
+| **部署** | `git push prod main` → Windows Server | 需要獨立 Node.js runtime |
+| **現有 Chat 模組** | §20 Intranet Chat（WebSocket，已在 prod）| 功能重複 |
+| **維護負擔** | 單一 Python codebase | 新增異質服務，雙倍維護成本 |
+
+嵌入 LobeChat = 在 FastAPI 系統旁邊常駐一個完全異質的 Node.js 服務，Auth 兩套、Deploy 兩套，日後出問題難以定位。
+
+---
+
+### 13.18.2 最佳選擇：Open WebUI + FastAPI Middleware
+
+**Open WebUI**（`open-webui/open-webui`）是目前與 JCK Web System 技術棧契合度最高的前端：
+
+| 評估維度 | Open WebUI | LobeChat |
+|----------|-----------|---------|
+| **核心語言** | Python（FastAPI）+ Svelte | Next.js（Node.js）|
+| **部署** | Docker 一行 / 或 pip install | npm build |
+| **Auth** | 內建（可 proxy 後靠外部 Session 守門）| 自帶 OAuth，橋接複雜 |
+| **OpenAI-compatible** | ✅ 原生支援自定義 API base | ✅ 支援 |
+| **多模型切換 UI** | ✅（Poe 風格，下拉選單）| ✅ |
+| **思考模式顯示** | ✅（顯示 Reasoning 折疊框）| ✅ |
+| **文件上傳 / RAG** | ✅ 原生支援 | ✅ 支援 |
+| **Streaming（逐字輸出）**| ✅ | ✅ |
+| **Poe 體驗相似度** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
+| **與 JCK 整合難度** | 低 | 高 |
+
+---
+
+### 13.18.3 系統架構（Phase 1 目標）
+
+```
+[員工瀏覽器]
+  └→ http://server:3210  （Open WebUI，Docker）
+        │
+        │  POST /v1/chat/completions（OpenAI 格式）
+        ▼
+  FastAPI Middleware（port 8001，JCK Web System 新 router）
+    ├─ Auth 守門：驗證 JCK session / API key 白名單
+    ├─ Model Routing：
+    │    fast   → gemini-3.1-flash-lite
+    │    pro    → gemini-3.1-pro
+    │    think  → gemini-3.1-pro + thinking_level=high
+    ├─ System Prompt 注入（按員工角色）
+    ├─ Query Sanitisation（見 §13.16.7）
+    └→ Vertex AI（Gemini 3.1）
+
+[PG: app_auth.user_credentials]  ← Middleware 查 Auth 用
+```
+
+**Phase 1 啟動指令**（POC 驗證用，server 上執行）：
+
+```powershell
+# 啟動 Open WebUI，指向你的 FastAPI middleware
+docker run -d --name jck-web-poe -p 3210:8080 `
+  -e OPENAI_API_BASE_URL=http://host.docker.internal:8001/v1 `
+  -e OPENAI_API_KEY=jck-internal `
+  -v jck-webui-data:/app/backend/data `
+  ghcr.io/open-webui/open-webui:main
+```
+
+---
+
+### 13.18.4 FastAPI Middleware 核心設計
+
+Middleware 是整個系統「過去、現在、將來」共用的抽象層，設計原則：**只改環境變數，不改程式碼**。
+
+```python
+# web/ai_middleware/config.py
+import os
+
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://us-central1-aiplatform.googleapis.com/...")
+LLM_API_KEY  = os.getenv("LLM_API_KEY", "")  # Vertex AI 用 token；vLLM 用 "dummy"
+
+MODEL_MAP = {
+    "fast":  os.getenv("MODEL_FAST",  "gemini-3.1-flash-lite"),
+    "pro":   os.getenv("MODEL_PRO",   "gemini-3.1-pro"),
+    "think": os.getenv("MODEL_THINK", "gemini-3.1-pro"),
+}
+```
+
+```python
+# web/ai_middleware/router.py（核心 SSE Streaming 轉發）
+from fastapi import APIRouter, Request, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+import openai, json
+from .config import LLM_BASE_URL, LLM_API_KEY, MODEL_MAP
+from ..session import require_auth  # 複用現有 JCK Auth
+
+router = APIRouter(prefix="/v1")
+
+@router.post("/chat/completions")
+async def chat(request: Request, user=Depends(require_auth)):
+    body = await request.json()
+    tier = body.pop("model", "fast")           # Open WebUI 傳來的 model 名
+    model_id = MODEL_MAP.get(tier, MODEL_MAP["fast"])
+
+    # 注入 System Prompt（按角色）
+    system = _get_system_prompt(user["role"])
+    messages = [{"role": "system", "content": system}] + body.get("messages", [])
+
+    client = openai.AsyncOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+
+    async def stream():
+        async with client.chat.completions.stream(
+            model=model_id, messages=messages,
+            extra_body={"thinking_level": "high"} if tier == "think" else {}
+        ) as s:
+            async for chunk in s:
+                yield f"data: {chunk.model_dump_json()}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+```
+
+**遷移成本**：Phase 1 → Phase 2（vLLM），只需改 `.env`：
+
+```env
+# Phase 1（現在）
+LLM_BASE_URL=https://us-central1-aiplatform.googleapis.com/v1/.../chat/completions
+LLM_API_KEY=<google_access_token>
+
+# Phase 2（Local vLLM 就緒後）
+LLM_BASE_URL=http://localhost:8000/v1
+LLM_API_KEY=dummy
+MODEL_FAST=Qwen/Qwen3.6-35B-A3B
+MODEL_PRO=Qwen/Qwen3.6-35B-A3B
+MODEL_THINK=Qwen/Qwen3.6-35B-A3B
+```
+
+前端 Open WebUI、Auth、RBAC、Prompt 模板——**完全不動**。
+
+---
+
+### 13.18.5 三條路的選擇建議
+
+| 方案 | Poe 體驗 | 整合 JCK Auth 難度 | Phase→Phase 遷移 | 推薦度 |
+|------|---------|------------------|-----------------|--------|
+| **Open WebUI + Middleware** | ⭐⭐⭐⭐⭐ | 低（Middleware 守門）| 改 `.env` | ✅ **首選** |
+| LobeChat + Middleware | ⭐⭐⭐⭐⭐ | 高（Node.js + OAuth 橋）| 改 `.env` | ⚠️ 不推薦 |
+| 擴展 §20 Intranet Chat | ⭐⭐⭐ | 無（已整合）| 最順滑 | ✅ 長期方向 |
+
+---
+
+### 13.18.6 各層重用率（Vertex AI → vLLM/Hermes）
+
+| 層 | Phase 1（Vertex AI）| Phase 2（vLLM）| Phase 3（Hermes）| 重用率 |
+|----|-------------------|---------------|----------------|--------|
+| **Open WebUI 前端** | ✅ | ✅ 不動 | ✅ 不動 | 100% |
+| **FastAPI Middleware** | ✅ | 改 `.env` | 改 `base_url` | 95% |
+| **Auth / RBAC** | ✅ | ✅ 不動 | ✅ 不動 | 100% |
+| **System Prompt / Model Map** | ✅ | ✅ 不動 | ✅ 不動 | 100% |
+| **RAG 管線** | Vertex AI Search | 改 embedding 源 | Hermes Skill 取代 | 40% |
+| **Cron / Telegram** | 自建 Daemon | 自建 Daemon | Hermes 原生取代 | ♻️ 替換 |
+
+**結論**：現在投入 Middleware 的開發功夫，約 80–95% 可直接帶入 Phase 2/3，不會浪費。
+
+---
+
 *本方案書由 GitHub Copilot 協助整理，最終決策請結合公司實際情況評估。*
 *第 13 節於 2026 年 4 月 18 日更新；第 13.8 節於 2026 年 4 月 19 日新增（參考 jason-effi-lab/karpathy-llm-wiki-vault）。*
 *第 13.9–13.11 節於 2026 年 4 月 19 日新增（硬件模型選型、Tool Use、llama-server Windows 並發）。*
@@ -2540,3 +2712,4 @@ if __name__ == "__main__":
 *第 13.15 節於 2026 年 4 月 19 日新增（CSA Text-to-SQL：Dify Tool Calling 直查 SQL Server，含安全邊界、FastAPI middleware、對話範例）。*
 *第 13.16 節於 2026 年 4 月 22 日新增（Email LLM Wiki + 企業 RBAC 架構預備設計：讀寫分離、Python Middleware 守門、VIP 雙軌物理隔離、Query Sanitisation、縱深防禦）。*
 *第 13.17 節於 2026 年 5 月 10 日新增（Hermes Agent 可行性評估：與 OpenClaw 同類的自主 Agent 框架，vLLM+Qwen 接入、Skill 設計、對比 Dify 的選型建議）。*
+*第 13.18 節於 2026 年 5 月 10 日新增（JCK Web Poe 最速落地方案：Open WebUI + FastAPI Middleware，LobeChat 排除原因，三階段重用率分析，Streaming Middleware 核心設計）。*
